@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
@@ -41,14 +42,20 @@ var (
 	pkt6Conn *ipv6.PacketConn
 
 	ipv4JoinedGroups = map[string]bool{}
-	ipv4Consumers    = map[interface{}]bool{}
+	ipv4Consumers    = map[interface{}]chan dnsMsgWrapper{}
 	ipv4Mutex        sync.Mutex
 	ipv6JoinedGroups = map[string]bool{}
-	ipv6Consumers    = map[interface{}]bool{}
+	ipv6Consumers    = map[interface{}]chan dnsMsgWrapper{}
 	ipv6Mutex        sync.Mutex
 )
 
-func joinUdp4Multicast(interfaces []net.Interface, consumer interface{}) error {
+type dnsMsgWrapper struct {
+	msg     *dns.Msg
+	ifIndex int
+	from    net.Addr
+}
+
+func joinUdp4Multicast(interfaces []net.Interface, consumer interface{}, msgCh chan dnsMsgWrapper) error {
 	ipv4Mutex.Lock()
 	defer ipv4Mutex.Unlock()
 
@@ -67,6 +74,7 @@ func joinUdp4Multicast(interfaces []net.Interface, consumer interface{}) error {
 		pkt4Conn = ipv4.NewPacketConn(udp4Conn)
 		pkt4Conn.SetControlMessage(ipv4.FlagInterface, true)
 		pkt4Conn.SetMulticastTTL(255)
+		go recv4()
 	}
 
 	// If no interfaces were provided, join on all.
@@ -96,10 +104,44 @@ func joinUdp4Multicast(interfaces []net.Interface, consumer interface{}) error {
 	}
 
 	if failedJoins < attemptedJoins {
-		ipv4Consumers[consumer] = true
+		ipv4Consumers[consumer] = msgCh
 	}
 
 	return err
+}
+
+func recv4() {
+	if pkt4Conn == nil {
+		return
+	}
+	var msg dns.Msg
+	buf := make([]byte, 65536)
+	for {
+		var ifIndex int
+		n, cm, from, err := pkt4Conn.ReadFrom(buf)
+		if err != nil {
+			break
+		}
+		if cm != nil {
+			ifIndex = cm.IfIndex
+		}
+		if err := msg.Unpack(buf[:n]); err != nil {
+			// log.Printf("[ERR] zeroconf: Failed to unpack packet: %v", err)
+			continue
+		}
+
+		msgW := dnsMsgWrapper{
+			msg:     &msg,
+			ifIndex: ifIndex,
+			from:    from,
+		}
+
+		for _, ch := range ipv4Consumers {
+			if ch != nil {
+				ch <- msgW
+			}
+		}
+	}
 }
 
 func leaveUdp4Multicast(interfaces []net.Interface) {
@@ -113,9 +155,9 @@ func leaveUdp4Multicast(interfaces []net.Interface) {
 
 func closeUdp4Connection(consumer interface{}) {
 	// Count this consumer as closed and then ensure all consumers have closed first.
-	ipv4Consumers[consumer] = false
-	for _, consuming := range ipv4Consumers {
-		if consuming {
+	ipv4Consumers[consumer] = nil
+	for _, handler := range ipv4Consumers {
+		if handler != nil {
 			return
 		}
 	}
@@ -138,7 +180,7 @@ func closeUdp4Connection(consumer interface{}) {
 	ipv4JoinedGroups = map[string]bool{}
 }
 
-func joinUdp6Multicast(interfaces []net.Interface, consumer interface{}) error {
+func joinUdp6Multicast(interfaces []net.Interface, consumer interface{}, msgCh chan dnsMsgWrapper) error {
 	ipv6Mutex.Lock()
 	defer ipv6Mutex.Unlock()
 
@@ -157,6 +199,7 @@ func joinUdp6Multicast(interfaces []net.Interface, consumer interface{}) error {
 		pkt6Conn = ipv6.NewPacketConn(udp6Conn)
 		pkt6Conn.SetControlMessage(ipv6.FlagInterface, true)
 		pkt6Conn.SetMulticastHopLimit(255)
+		go recv6()
 	}
 
 	// If no interfaces were provided, join on all.
@@ -186,10 +229,44 @@ func joinUdp6Multicast(interfaces []net.Interface, consumer interface{}) error {
 	}
 
 	if failedJoins < attemptedJoins {
-		ipv6Consumers[consumer] = true
+		ipv6Consumers[consumer] = msgCh
 	}
 
 	return err
+}
+
+func recv6() {
+	if pkt6Conn == nil {
+		return
+	}
+	var msg dns.Msg
+	buf := make([]byte, 65536)
+	for {
+		var ifIndex int
+		n, cm, from, err := pkt6Conn.ReadFrom(buf)
+		if err != nil {
+			break
+		}
+		if cm != nil {
+			ifIndex = cm.IfIndex
+		}
+		if err := msg.Unpack(buf[:n]); err != nil {
+			// log.Printf("[ERR] zeroconf: Failed to unpack packet: %v", err)
+			continue
+		}
+
+		msgW := dnsMsgWrapper{
+			msg:     &msg,
+			ifIndex: ifIndex,
+			from:    from,
+		}
+
+		for _, ch := range ipv6Consumers {
+			if ch != nil {
+				ch <- msgW
+			}
+		}
+	}
 }
 
 func leaveUdp6Multicast(interfaces []net.Interface) {
@@ -203,9 +280,9 @@ func leaveUdp6Multicast(interfaces []net.Interface) {
 
 func closeUdp6Connection(consumer interface{}) {
 	// Count this consumer as closed and then ensure all consumers have closed first.
-	ipv6Consumers[consumer] = false
-	for _, consuming := range ipv4Consumers {
-		if consuming {
+	ipv6Consumers[consumer] = nil
+	for _, handler := range ipv4Consumers {
+		if handler != nil {
 			return
 		}
 	}

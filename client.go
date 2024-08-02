@@ -60,8 +60,8 @@ type Resolver struct {
 }
 
 // NewResolver creates a new resolver and joins the UDP multicast groups to
-// listen for mDNS messages.
-func NewResolver(options ...ClientOption) (*Resolver, error) {
+// browse for the specified service.
+func NewBrowser(ctx context.Context, service, domain string, entries chan<- *ServiceEntry, options ...ClientOption) (*Resolver, error) {
 	// Apply default configuration and load supplied options.
 	var conf = clientOpts{
 		listenOn: IPv4AndIPv6,
@@ -76,17 +76,10 @@ func NewResolver(options ...ClientOption) (*Resolver, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Resolver{
+	r := &Resolver{
 		c: c,
-	}, nil
-}
+	}
 
-func (r *Resolver) Close() {
-	r.c.shutdown()
-}
-
-// Browse for all services of a given type in a given domain.
-func (r *Resolver) Browse(ctx context.Context, service, domain string, entries chan<- *ServiceEntry) error {
 	params := defaultParams(service)
 	if domain != "" {
 		params.Domain = domain
@@ -96,10 +89,10 @@ func (r *Resolver) Browse(ctx context.Context, service, domain string, entries c
 	ctx, cancel := context.WithCancel(ctx)
 	go r.c.mainloop(ctx, params)
 
-	err := r.c.query(params)
+	err = r.c.query(params)
 	if err != nil {
 		cancel()
-		return err
+		return nil, err
 	}
 	// If previous probe was ok, it should be fine now. In case of an error later on,
 	// the entries' queue is closed.
@@ -109,11 +102,30 @@ func (r *Resolver) Browse(ctx context.Context, service, domain string, entries c
 		}
 	}()
 
-	return nil
+	return r, nil
 }
 
-// Lookup a specific service by its name and type in a given domain.
-func (r *Resolver) Lookup(ctx context.Context, instance, service, domain string, entries chan<- *ServiceEntry) error {
+// NewLookup creates a new resolver and joins the UDP multicast groups to
+// browse for the specified service instance.
+func NewLookup(ctx context.Context, instance, service, domain string, entries chan<- *ServiceEntry, options ...ClientOption) (*Resolver, error) {
+	// Apply default configuration and load supplied options.
+	var conf = clientOpts{
+		listenOn: IPv4AndIPv6,
+	}
+	for _, o := range options {
+		if o != nil {
+			o(&conf)
+		}
+	}
+
+	c, err := newClient(conf)
+	if err != nil {
+		return nil, err
+	}
+	r := &Resolver{
+		c: c,
+	}
+
 	params := defaultParams(service)
 	params.Instance = instance
 	if domain != "" {
@@ -122,11 +134,11 @@ func (r *Resolver) Lookup(ctx context.Context, instance, service, domain string,
 	params.Entries = entries
 	ctx, cancel := context.WithCancel(ctx)
 	go r.c.mainloop(ctx, params)
-	err := r.c.query(params)
+	err = r.c.query(params)
 	if err != nil {
 		// cancel mainloop
 		cancel()
-		return err
+		return nil, err
 	}
 	// If previous probe was ok, it should be fine now. In case of an error later on,
 	// the entries' queue is closed.
@@ -136,7 +148,11 @@ func (r *Resolver) Lookup(ctx context.Context, instance, service, domain string,
 		}
 	}()
 
-	return nil
+	return r, nil
+}
+
+func (r *Resolver) Close() {
+	r.c.shutdown()
 }
 
 // defaultParams returns a default set of QueryParams.
@@ -146,7 +162,8 @@ func defaultParams(service string) *lookupParams {
 
 // Client structure encapsulates both IPv4/IPv6 UDP connections.
 type client struct {
-	ifaces []net.Interface
+	ifaces   []net.Interface
+	receiver chan dnsMsgWrapper
 }
 
 // Client structure constructor
@@ -156,19 +173,20 @@ func newClient(opts clientOpts) (*client, error) {
 		ifaces = listMulticastInterfaces()
 	}
 	c := &client{
-		ifaces: ifaces,
+		ifaces:   ifaces,
+		receiver: make(chan dnsMsgWrapper, 64),
 	}
 
 	// IPv4 interfaces
 	if (opts.listenOn & IPv4) > 0 {
-		err := joinUdp4Multicast(ifaces, c)
+		err := joinUdp4Multicast(ifaces, c, c.receiver)
 		if err != nil {
 			return nil, err
 		}
 	}
 	// IPv6 interfaces
 	if (opts.listenOn & IPv6) > 0 {
-		err := joinUdp6Multicast(ifaces, c)
+		err := joinUdp6Multicast(ifaces, c, c.receiver)
 		if err != nil {
 			return nil, err
 		}
@@ -179,15 +197,6 @@ func newClient(opts clientOpts) (*client, error) {
 
 // Start listeners and waits for the shutdown signal from exit channel
 func (c *client) mainloop(ctx context.Context, params *lookupParams) {
-	// start listening for responses
-	msgCh := make(chan *dns.Msg, 32)
-	if pkt4Conn != nil {
-		go c.recv(ctx, pkt4Conn, msgCh)
-	}
-	if pkt6Conn != nil {
-		go c.recv(ctx, pkt6Conn, msgCh)
-	}
-
 	// Iterate through channels from listeners goroutines
 	var entries, sentEntries map[string]*ServiceEntry
 	sentEntries = make(map[string]*ServiceEntry)
@@ -198,7 +207,16 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 			params.done()
 			c.shutdown()
 			return
-		case msg := <-msgCh:
+		case msgW := <-c.receiver:
+			msg := msgW.msg
+
+			// mDNS answers don't have questions, according to RFC6762 section 6,
+			// but just in case the responder isn't following the RFC, also make
+			// sure there's at least one answer.
+			if msg.Question != nil || len(msg.Question) > 0 ||
+				msg.Answer == nil || len(msg.Answer) == 0 {
+				continue
+			}
 			entries = make(map[string]*ServiceEntry)
 			sections := append(msg.Answer, msg.Ns...)
 			sections = append(sections, msg.Extra...)
@@ -306,58 +324,6 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 func (c *client) shutdown() {
 	closeUdp4Connection(c)
 	closeUdp6Connection(c)
-}
-
-// Data receiving routine reads from connection, unpacks packets into dns.Msg
-// structures and sends them to a given msgCh channel
-func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
-	var readFrom func([]byte) (n int, src net.Addr, err error)
-
-	switch pConn := l.(type) {
-	case *ipv6.PacketConn:
-		readFrom = func(b []byte) (n int, src net.Addr, err error) {
-			n, _, src, err = pConn.ReadFrom(b)
-			return
-		}
-	case *ipv4.PacketConn:
-		readFrom = func(b []byte) (n int, src net.Addr, err error) {
-			n, _, src, err = pConn.ReadFrom(b)
-			return
-		}
-
-	default:
-		return
-	}
-
-	buf := make([]byte, 65536)
-	var fatalErr error
-	for {
-		// Handles the following cases:
-		// - ReadFrom aborts with error due to closed UDP connection -> causes ctx cancel
-		// - ReadFrom aborts otherwise.
-		// TODO: the context check can be removed. Verify!
-		if ctx.Err() != nil || fatalErr != nil {
-			return
-		}
-
-		n, _, err := readFrom(buf)
-		if err != nil {
-			fatalErr = err
-			continue
-		}
-		msg := new(dns.Msg)
-		if err := msg.Unpack(buf[:n]); err != nil {
-			// log.Printf("[WARN] mdns: Failed to unpack packet: %v", err)
-			continue
-		}
-		select {
-		case msgCh <- msg:
-			// Submit decoded DNS message and continue.
-		case <-ctx.Done():
-			// Abort.
-			return
-		}
-	}
 }
 
 // periodicQuery sens multiple probes until a valid response is received by
