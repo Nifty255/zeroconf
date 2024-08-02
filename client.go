@@ -146,11 +146,7 @@ func defaultParams(service string) *lookupParams {
 
 // Client structure encapsulates both IPv4/IPv6 UDP connections.
 type client struct {
-	udp4conn *net.UDPConn
-	ipv4conn *ipv4.PacketConn
-	udp6conn *net.UDPConn
-	ipv6conn *ipv6.PacketConn
-	ifaces   []net.Interface
+	ifaces []net.Interface
 }
 
 // Client structure constructor
@@ -159,45 +155,37 @@ func newClient(opts clientOpts) (*client, error) {
 	if len(ifaces) == 0 {
 		ifaces = listMulticastInterfaces()
 	}
+	c := &client{
+		ifaces: ifaces,
+	}
+
 	// IPv4 interfaces
-	var udp4conn *net.UDPConn
-	var ipv4conn *ipv4.PacketConn
 	if (opts.listenOn & IPv4) > 0 {
-		var err error
-		udp4conn, ipv4conn, err = joinUdp4Multicast(ifaces)
+		err := joinUdp4Multicast(ifaces, c)
 		if err != nil {
 			return nil, err
 		}
 	}
 	// IPv6 interfaces
-	var udp6conn *net.UDPConn
-	var ipv6conn *ipv6.PacketConn
 	if (opts.listenOn & IPv6) > 0 {
-		var err error
-		udp6conn, ipv6conn, err = joinUdp6Multicast(ifaces)
+		err := joinUdp6Multicast(ifaces, c)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return &client{
-		udp4conn: udp4conn,
-		udp6conn: udp6conn,
-		ipv4conn: ipv4conn,
-		ipv6conn: ipv6conn,
-		ifaces:   ifaces,
-	}, nil
+	return c, nil
 }
 
 // Start listeners and waits for the shutdown signal from exit channel
 func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 	// start listening for responses
 	msgCh := make(chan *dns.Msg, 32)
-	if c.ipv4conn != nil {
-		go c.recv(ctx, c.ipv4conn, msgCh)
+	if pkt4Conn != nil {
+		go c.recv(ctx, pkt4Conn, msgCh)
 	}
-	if c.ipv6conn != nil {
-		go c.recv(ctx, c.ipv6conn, msgCh)
+	if pkt6Conn != nil {
+		go c.recv(ctx, pkt6Conn, msgCh)
 	}
 
 	// Iterate through channels from listeners goroutines
@@ -316,20 +304,8 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 
 // Shutdown client will close currently open connections and channel implicitly.
 func (c *client) shutdown() {
-	if c.ipv4conn != nil {
-		leaveUdp4Multicast(c.ifaces, c.ipv4conn)
-		c.ipv4conn.Close()
-	}
-	if c.udp4conn != nil {
-		c.udp4conn.Close()
-	}
-	if c.ipv6conn != nil {
-		leaveUdp6Multicast(c.ifaces, c.ipv6conn)
-		c.ipv6conn.Close()
-	}
-	if c.udp6conn != nil {
-		c.udp6conn.Close()
-	}
+	closeUdp4Connection(c)
+	closeUdp6Connection(c)
 }
 
 // Data receiving routine reads from connection, unpacks packets into dns.Msg
@@ -462,7 +438,7 @@ func (c *client) sendQuery(msg *dns.Msg) error {
 	if err != nil {
 		return err
 	}
-	if c.ipv4conn != nil {
+	if pkt4Conn != nil {
 		// See https://pkg.go.dev/golang.org/x/net/ipv4#pkg-note-BUG
 		// As of Golang 1.18.4
 		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
@@ -472,14 +448,14 @@ func (c *client) sendQuery(msg *dns.Msg) error {
 			case "darwin", "ios", "linux":
 				wcm.IfIndex = c.ifaces[ifi].Index
 			default:
-				if err := c.ipv4conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
+				if err := pkt4Conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
 					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
 				}
 			}
-			c.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
+			pkt4Conn.WriteTo(buf, &wcm, ipv4Addr)
 		}
 	}
-	if c.ipv6conn != nil {
+	if pkt6Conn != nil {
 		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
 		// As of Golang 1.18.4
 		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
@@ -489,11 +465,11 @@ func (c *client) sendQuery(msg *dns.Msg) error {
 			case "darwin", "ios", "linux":
 				wcm.IfIndex = c.ifaces[ifi].Index
 			default:
-				if err := c.ipv6conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
+				if err := pkt6Conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
 					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
 				}
 			}
-			c.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
+			pkt6Conn.WriteTo(buf, &wcm, ipv6Addr)
 		}
 	}
 	return nil

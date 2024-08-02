@@ -143,12 +143,8 @@ const (
 
 // Server structure encapsulates both IPv4/IPv6 UDP connections
 type Server struct {
-	service  *ServiceEntry
-	udp4conn *net.UDPConn
-	ipv4conn *ipv4.PacketConn
-	udp6conn *net.UDPConn
-	ipv6conn *ipv6.PacketConn
-	ifaces   []net.Interface
+	service *ServiceEntry
+	ifaces  []net.Interface
 
 	shouldShutdown chan struct{}
 	shutdownLock   sync.Mutex
@@ -159,11 +155,16 @@ type Server struct {
 
 // Constructs server structure
 func newServer(ifaces []net.Interface) (*Server, error) {
-	udp4conn, ipv4conn, err4 := joinUdp4Multicast(ifaces)
+	s := &Server{
+		ifaces:         ifaces,
+		ttl:            3200,
+		shouldShutdown: make(chan struct{}),
+	}
+	err4 := joinUdp4Multicast(ifaces, s)
 	if err4 != nil {
 		log.Printf("[zeroconf] no suitable IPv4 interface: %s", err4.Error())
 	}
-	udp6conn, ipv6conn, err6 := joinUdp6Multicast(ifaces)
+	err6 := joinUdp6Multicast(ifaces, s)
 	if err6 != nil {
 		log.Printf("[zeroconf] no suitable IPv6 interface: %s", err6.Error())
 	}
@@ -172,27 +173,13 @@ func newServer(ifaces []net.Interface) (*Server, error) {
 		return nil, fmt.Errorf("no supported interface")
 	}
 
-	s := &Server{
-		udp4conn:	udp4conn,
-		ipv4conn:       ipv4conn,
-		udp6conn:	udp6conn,
-		ipv6conn:       ipv6conn,
-		ifaces:         ifaces,
-		ttl:            3200,
-		shouldShutdown: make(chan struct{}),
-	}
-
 	return s, nil
 }
 
 // Start listeners and waits for the shutdown signal from exit channel
 func (s *Server) mainloop() {
-	if s.ipv4conn != nil {
-		go s.recv4(s.ipv4conn)
-	}
-	if s.ipv6conn != nil {
-		go s.recv6(s.ipv6conn)
-	}
+	go s.recv4()
+	go s.recv6()
 }
 
 // Shutdown closes all udp connections and unregisters the service
@@ -223,20 +210,8 @@ func (s *Server) shutdown() error {
 
 	close(s.shouldShutdown)
 
-	if s.ipv4conn != nil {
-		leaveUdp4Multicast(s.ifaces, s.ipv4conn)
-		s.ipv4conn.Close()
-	}
-	if s.udp4conn != nil {
-		s.udp4conn.Close()
-	}
-	if s.ipv6conn != nil {
-		leaveUdp6Multicast(s.ifaces, s.ipv6conn)
-		s.ipv6conn.Close()
-	}
-	if s.udp6conn != nil {
-		s.udp6conn.Close()
-	}
+	closeUdp4Connection(s)
+	closeUdp6Connection(s)
 
 	// Wait for connection and routines to be closed
 	s.shutdownEnd.Wait()
@@ -246,8 +221,8 @@ func (s *Server) shutdown() error {
 }
 
 // recv is a long running routine to receive packets from an interface
-func (s *Server) recv4(c *ipv4.PacketConn) {
-	if c == nil {
+func (s *Server) recv4() {
+	if pkt4Conn == nil {
 		return
 	}
 	buf := make([]byte, 65536)
@@ -259,7 +234,9 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 			return
 		default:
 			var ifIndex int
-			n, cm, from, err := c.ReadFrom(buf)
+			ipv4Mutex.Lock()
+			n, cm, from, err := pkt4Conn.ReadFrom(buf)
+			ipv4Mutex.Unlock()
 			if err != nil {
 				continue
 			}
@@ -272,8 +249,8 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 }
 
 // recv is a long running routine to receive packets from an interface
-func (s *Server) recv6(c *ipv6.PacketConn) {
-	if c == nil {
+func (s *Server) recv6() {
+	if pkt6Conn == nil {
 		return
 	}
 	buf := make([]byte, 65536)
@@ -285,7 +262,9 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 			return
 		default:
 			var ifIndex int
-			n, cm, from, err := c.ReadFrom(buf)
+			ipv6Mutex.Lock()
+			n, cm, from, err := pkt6Conn.ReadFrom(buf)
+			ipv6Mutex.Unlock()
 			if err != nil {
 				continue
 			}
@@ -537,7 +516,7 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 }
 
 // Perform probing & announcement
-//TODO: implement a proper probing & conflict resolution
+// TODO: implement a proper probing & conflict resolution
 func (s *Server) probe() {
 	q := new(dns.Msg)
 	q.SetQuestion(s.service.ServiceInstanceName(), dns.TypePTR)
@@ -707,22 +686,26 @@ func (s *Server) unicastResponse(resp *dns.Msg, ifIndex int, from net.Addr) erro
 	}
 	addr := from.(*net.UDPAddr)
 	if addr.IP.To4() != nil {
+		ipv4Mutex.Lock()
 		if ifIndex != 0 {
 			var wcm ipv4.ControlMessage
 			wcm.IfIndex = ifIndex
-			_, err = s.ipv4conn.WriteTo(buf, &wcm, addr)
+			_, err = pkt4Conn.WriteTo(buf, &wcm, addr)
 		} else {
-			_, err = s.ipv4conn.WriteTo(buf, nil, addr)
+			_, err = pkt4Conn.WriteTo(buf, nil, addr)
 		}
+		ipv4Mutex.Unlock()
 		return err
 	} else {
+		ipv6Mutex.Lock()
 		if ifIndex != 0 {
 			var wcm ipv6.ControlMessage
 			wcm.IfIndex = ifIndex
-			_, err = s.ipv6conn.WriteTo(buf, &wcm, addr)
+			_, err = pkt6Conn.WriteTo(buf, &wcm, addr)
 		} else {
-			_, err = s.ipv6conn.WriteTo(buf, nil, addr)
+			_, err = pkt6Conn.WriteTo(buf, nil, addr)
 		}
+		ipv6Mutex.Unlock()
 		return err
 	}
 }
@@ -733,7 +716,8 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 	if err != nil {
 		return err
 	}
-	if s.ipv4conn != nil {
+	if pkt4Conn != nil {
+		ipv4Mutex.Lock()
 		// See https://pkg.go.dev/golang.org/x/net/ipv4#pkg-note-BUG
 		// As of Golang 1.18.4
 		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
@@ -744,27 +728,29 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 				wcm.IfIndex = ifIndex
 			default:
 				iface, _ := net.InterfaceByIndex(ifIndex)
-				if err := s.ipv4conn.SetMulticastInterface(iface); err != nil {
+				if err := pkt4Conn.SetMulticastInterface(iface); err != nil {
 					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
 				}
 			}
-			s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
+			pkt4Conn.WriteTo(buf, &wcm, ipv4Addr)
 		} else {
 			for _, intf := range s.ifaces {
 				switch runtime.GOOS {
 				case "darwin", "ios", "linux":
 					wcm.IfIndex = intf.Index
 				default:
-					if err := s.ipv4conn.SetMulticastInterface(&intf); err != nil {
+					if err := pkt4Conn.SetMulticastInterface(&intf); err != nil {
 						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
 					}
 				}
-				s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
+				pkt4Conn.WriteTo(buf, &wcm, ipv4Addr)
 			}
 		}
+		ipv4Mutex.Unlock()
 	}
 
-	if s.ipv6conn != nil {
+	if pkt6Conn != nil {
+		ipv6Mutex.Lock()
 		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
 		// As of Golang 1.18.4
 		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
@@ -775,24 +761,25 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 				wcm.IfIndex = ifIndex
 			default:
 				iface, _ := net.InterfaceByIndex(ifIndex)
-				if err := s.ipv6conn.SetMulticastInterface(iface); err != nil {
+				if err := pkt6Conn.SetMulticastInterface(iface); err != nil {
 					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
 				}
 			}
-			s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
+			pkt6Conn.WriteTo(buf, &wcm, ipv6Addr)
 		} else {
 			for _, intf := range s.ifaces {
 				switch runtime.GOOS {
 				case "darwin", "ios", "linux":
 					wcm.IfIndex = intf.Index
 				default:
-					if err := s.ipv6conn.SetMulticastInterface(&intf); err != nil {
+					if err := pkt6Conn.SetMulticastInterface(&intf); err != nil {
 						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
 					}
 				}
-				s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
+				pkt6Conn.WriteTo(buf, &wcm, ipv6Addr)
 			}
 		}
+		ipv6Mutex.Unlock()
 	}
 	return nil
 }
