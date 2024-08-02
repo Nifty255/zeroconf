@@ -83,7 +83,7 @@ func joinUdp4Multicast(interfaces []net.Interface, consumer interface{}) error {
 		}
 		attemptedJoins++
 		err := pkt4Conn.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv4})
-		ipv4JoinedGroups[iface.Name] = err != nil
+		ipv4JoinedGroups[iface.Name] = err == nil
 		if !ipv4JoinedGroups[iface.Name] {
 			failedJoins++
 		}
@@ -173,7 +173,7 @@ func joinUdp6Multicast(interfaces []net.Interface, consumer interface{}) error {
 		}
 		attemptedJoins++
 		err := pkt6Conn.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv6})
-		ipv6JoinedGroups[iface.Name] = err != nil
+		ipv6JoinedGroups[iface.Name] = err == nil
 		if !ipv6JoinedGroups[iface.Name] {
 			failedJoins++
 		}
